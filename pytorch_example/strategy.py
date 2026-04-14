@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import random
 import time
 from logging import INFO
 from pathlib import Path
@@ -10,7 +11,14 @@ from typing import Callable, Iterable, Optional
 
 import torch
 import wandb
-from flwr.app import ArrayRecord, ConfigRecord, Message, MetricRecord
+from flwr.app import (
+    ArrayRecord,
+    ConfigRecord,
+    Message,
+    MessageType,
+    MetricRecord,
+    RecordDict,
+)
 from flwr.common import log, logger
 from flwr.serverapp import Grid
 from flwr.serverapp.strategy import FedAvg, Result
@@ -20,14 +28,71 @@ PROJECT_NAME = "FLOWER-advanced-pytorch"
 
 
 class CustomFedAvg(FedAvg):
-    """A class that behaves like FedAvg but has extra functionality added into the
-    `start` method. It also overrides `configure_train` to implement a simple learning
-    rate schedule.
+    """FedAvg extended with a Resource-Score client selection strategy.
 
-    This strategy: (1) saves results to the filesystem each rounds, (2)
-    saves a checkpoint of the global model when a new best is found,
+    Instead of selecting clients randomly (standard FedAvg), this strategy scores
+    every available node using a weighted formula:
+
+        Score = (α × BatteryLevel) + (β × NetworkBandwidth) − (γ × PastFailures)
+
+    The top-scoring nodes are selected for each training round.  Battery level
+    (0–100) and network bandwidth (1–100 Mbps) are simulated deterministically
+    from the node ID, while past failures are accumulated across rounds.
+
+    This strategy also: (1) saves results to the filesystem each round,
+    (2) saves a checkpoint of the global model when a new best is found,
     (3) logs results to W&B.
+
+    Parameters
+    ----------
+    alpha : float (default: 0.4)
+        Weight for the BatteryLevel term in the resource score.
+    beta : float (default: 0.4)
+        Weight for the NetworkBandwidth term in the resource score.
+    gamma : float (default: 0.2)
+        Penalty weight for the PastFailures term in the resource score.
+    **kwargs
+        All other keyword arguments are forwarded to :class:`FedAvg`.
     """
+
+    def __init__(
+        self,
+        alpha: float = 0.4,
+        beta: float = 0.4,
+        gamma: float = 0.2,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        # Maps node_id -> cumulative number of failed rounds
+        self.past_failures: dict[int, int] = {}
+
+    # ------------------------------------------------------------------
+    # Resource-score helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simulate_battery(node_id: int) -> float:
+        """Return a deterministic battery level in [0, 100] for *node_id*."""
+        return random.Random(node_id ^ 0xABCDEF).uniform(0, 100)
+
+    @staticmethod
+    def _simulate_bandwidth(node_id: int) -> float:
+        """Return a deterministic network bandwidth in [1, 100] Mbps for *node_id*."""
+        return random.Random(node_id ^ 0x123456).uniform(1, 100)
+
+    def _compute_resource_score(self, node_id: int) -> float:
+        """Compute the resource score for *node_id* using the weighted formula."""
+        battery = self._simulate_battery(node_id)
+        bandwidth = self._simulate_bandwidth(node_id)
+        failures = self.past_failures.get(node_id, 0)
+        return (
+            (self.alpha * battery)
+            + (self.beta * bandwidth)
+            - (self.gamma * failures)
+        )
 
     def set_save_path_and_run_dir(self, path: Path, run_dir: str):
         """Set the path where results and model checkpoints will be saved."""
@@ -82,13 +147,106 @@ class CustomFedAvg(FedAvg):
     def configure_train(
         self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
     ) -> Iterable[Message]:
-        """Configure the next round of federated training."""
+        """Configure the next round using resource-score client selection.
+
+        Each available node is assigned a score via::
+
+            score = (α × battery) + (β × bandwidth) − (γ × past_failures)
+
+        The top ``num_nodes`` nodes (determined by ``fraction_train``) are
+        selected instead of the random sampling used in standard FedAvg.
+        """
         # Perform basic learning rate scheduling
         if server_round == 5:  # half LR at round 5
             config["lr"] = config["lr"] * 0.5
             logger.log(INFO, "⚙️ Adjusted learning rate to %f", config["lr"])
-        # Continue with standard FedAvg configure_train
-        return super().configure_train(server_round, arrays, config, grid)
+
+        if self.fraction_train == 0.0:
+            return []
+
+        # Wait until the minimum number of nodes is available
+        all_node_ids = list(grid.get_node_ids())
+        while len(all_node_ids) < self.min_available_nodes:
+            logger.log(
+                INFO,
+                "Waiting for nodes: %d connected (minimum: %d)",
+                len(all_node_ids),
+                self.min_available_nodes,
+            )
+            time.sleep(1)
+            all_node_ids = list(grid.get_node_ids())
+
+        # Determine how many nodes to select
+        num_nodes = max(
+            int(len(all_node_ids) * self.fraction_train), self.min_train_nodes
+        )
+
+        # Score every available node and sort by score (descending)
+        scored_nodes = [
+            (self._compute_resource_score(nid), nid) for nid in all_node_ids
+        ]
+        scored_nodes.sort(key=lambda x: x[0], reverse=True)
+
+        # Log per-node resource information
+        logger.log(INFO, "📊 Resource scores for round %d:", server_round)
+        for score, nid in scored_nodes:
+            battery = self._simulate_battery(nid)
+            bandwidth = self._simulate_bandwidth(nid)
+            failures = self.past_failures.get(nid, 0)
+            logger.log(
+                INFO,
+                "   Node %d → score=%.2f  "
+                "(battery=%.1f%%, bandwidth=%.1f Mbps, failures=%d)",
+                nid,
+                score,
+                battery,
+                bandwidth,
+                failures,
+            )
+
+        # Select the top-scoring nodes
+        selected_node_ids = [nid for _, nid in scored_nodes[:num_nodes]]
+        logger.log(
+            INFO,
+            "🎯 Resource-aware selection: %d/%d nodes selected "
+            "(α=%.2f, β=%.2f, γ=%.2f)",
+            len(selected_node_ids),
+            len(all_node_ids),
+            self.alpha,
+            self.beta,
+            self.gamma,
+        )
+
+        # Inject current server round into config (required by FedAvg protocol)
+        config["server-round"] = server_round
+
+        # Construct and return training messages for the selected nodes
+        record = RecordDict(
+            {self.arrayrecord_key: arrays, self.configrecord_key: config}
+        )
+        return self._construct_messages(record, selected_node_ids, MessageType.TRAIN)
+
+    def aggregate_train(
+        self,
+        server_round: int,
+        replies: Iterable[Message],
+    ) -> tuple[ArrayRecord | None, MetricRecord | None]:
+        """Aggregate training results and update per-node failure counts."""
+        replies_list = list(replies)
+
+        # Track failed nodes so their score is penalised in future rounds
+        for msg in replies_list:
+            if msg.has_error():
+                node_id = msg.metadata.src_node_id
+                self.past_failures[node_id] = self.past_failures.get(node_id, 0) + 1
+                logger.log(
+                    INFO,
+                    "⚠️  Node %d failed (total failures: %d)",
+                    node_id,
+                    self.past_failures[node_id],
+                )
+
+        return super().aggregate_train(server_round, replies_list)
 
     def start(
         self,

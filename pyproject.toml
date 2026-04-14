@@ -32,3 +32,8 @@ fraction-train = 0.25
 fraction-evaluate = 0.5
 local-epochs = 1
 server-device = "cpu"
+# Resource-score weights for client selection
+# Score = (alpha * BatteryLevel) + (beta * NetworkBandwidth) - (gamma * PastFailures)
+resource-score-alpha = 0.4
+resource-score-beta = 0.4
+resource-score-gamma = 0.2
