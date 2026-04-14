@@ -157,7 +157,7 @@ class CustomFedAvg(FedAvg):
         selected instead of the random sampling used in standard FedAvg.
         """
         # Perform basic learning rate scheduling
-        if server_round == 5:  # half LR at round 5
+        if server_round == 3:  # half LR at round 3
             config["lr"] = config["lr"] * 0.5
             logger.log(INFO, "⚙️ Adjusted learning rate to %f", config["lr"])
 
