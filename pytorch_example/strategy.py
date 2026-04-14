@@ -7,13 +7,18 @@ import random
 import time
 from logging import INFO
 from pathlib import Path
-from time import sleep
 from typing import Callable, Iterable, Optional
 
 import torch
 import wandb
-from flwr.app import ArrayRecord, ConfigRecord, Message, MessageType, MetricRecord
-from flwr.app import RecordDict
+from flwr.app import (
+    ArrayRecord,
+    ConfigRecord,
+    Message,
+    MessageType,
+    MetricRecord,
+    RecordDict,
+)
 from flwr.common import log, logger
 from flwr.serverapp import Grid
 from flwr.serverapp.strategy import FedAvg, Result
@@ -160,16 +165,16 @@ class CustomFedAvg(FedAvg):
             return []
 
         # Wait until the minimum number of nodes is available
-        while (
-            len(all_node_ids := list(grid.get_node_ids())) < self.min_available_nodes
-        ):
+        all_node_ids = list(grid.get_node_ids())
+        while len(all_node_ids) < self.min_available_nodes:
             logger.log(
                 INFO,
                 "Waiting for nodes: %d connected (minimum: %d)",
                 len(all_node_ids),
                 self.min_available_nodes,
             )
-            sleep(1)
+            time.sleep(1)
+            all_node_ids = list(grid.get_node_ids())
 
         # Determine how many nodes to select
         num_nodes = max(
